@@ -260,6 +260,18 @@ class TopicMemoryScopeProcessor:
                 cursor = await self._cursors.load(connection, assignment.scope_id, assignment.binding_name)
                 source_after = 0 if cursor is None else cursor.cursor.sequence
                 if source_after >= target.source_through:
+                                    # --- 新增：按新增来源条目数触发判断 ---
+                if self._topic_memory_source_count_threshold is not None:
+                    remaining_sources = target.source_through - source_after
+                    # 如果不是显式 flush（无 captured_flush_generation），且剩余量小于阈值
+                    if target.captured_flush_generation is None and remaining_sources < self._topic_memory_source_count_threshold:
+                        if not did_work:
+                            # 一个都没处理，直接返回等待
+                            return ArtifactProcessingWorkerCompletion(noop=True)
+                        else:
+                            # 已经处理了一部分，剩下的不够门槛，结束当前批次
+                            break
+                # ---------------------------------------
                     await self._lock_source_head(connection, assignment.scope_id)
                     if self._commit_authorizer is not None:
                         await self._commit_authorizer(connection, assignment.scope_id, ())
