@@ -117,6 +117,8 @@ class TopicMemoryScopeProcessor:
         pending: ArtifactProcessingPendingRepository | None = None,
         commit_authorizer: TopicMemoryCommitAuthorizer | None = None,
         source_window_limit: int = MAX_TOPIC_MEMORY_WINDOW_SOURCES,
+        topic_memory_source_count_threshold: int | None = None,
+        memory_source_count_threshold: int | None = None,
     ) -> None:
         if type(source_window_limit) is not int or source_window_limit < 1:
             raise TopicMemoryGenerationError("invalid_window")
@@ -127,6 +129,18 @@ class TopicMemoryScopeProcessor:
         self._leases = ArtifactProcessingLeaseRepository() if leases is None else leases
         self._intents = ArtifactProcessingIntentRepository() if intents is None else intents
         self._pending = ArtifactProcessingPendingRepository() if pending is None else pending
+        self._topic_memory_source_count_threshold = None
+        self._memory_source_count_threshold = None
+
+        if topic_memory_source_count_threshold is not None:
+            if type(topic_memory_source_count_threshold) is not int or topic_memory_source_count_threshold <= 0:
+                raise TopicMemoryGenerationError("invalid_topic_memory_source_count_threshold")
+            self._topic_memory_source_count_threshold = topic_memory_source_count_threshold
+
+        if memory_source_count_threshold is not None:
+            if type(memory_source_count_threshold) is not int or memory_source_count_threshold <= 0:
+                raise TopicMemoryGenerationError("invalid_memory_source_count_threshold")
+            self._memory_source_count_threshold = memory_source_count_threshold
         self._commit_authorizer = commit_authorizer
         self._source_window_limit = min(source_window_limit, MAX_TOPIC_MEMORY_WINDOW_SOURCES)
 
