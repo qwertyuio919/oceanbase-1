@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +109,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal span of a Memory entry, kept with its exact source coordinates."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -235,6 +249,9 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection and request.assembly is None:
+            return self._build_fragment_result(request=request, memory_candidates=memory_candidates)
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -255,6 +272,104 @@ class PreparedContextBuilder:
             origins=origins,
             omissions=omissions,
         )
+
+    def _build_fragment_result(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        content, origins, fragments, omissions = self._select_fragments(request, memory_candidates)
+        if content is None:
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=omissions)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=origins,
+            omissions=omissions,
+            fragments=fragments,
+        )
+
+    def _select_fragments(
+        self,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[
+        str | None,
+        tuple[PreparedContextOrigin, ...],
+        tuple[PreparedContextFragment, ...],
+        PreparedContextOmissions,
+    ]:
+        """Select query-relevant literal spans from the Memory candidates.
+
+        Only the Memory family participates: the caller already narrowed recall to one query.
+        Spans are whole sentences of the entry text, so every returned fragment is an exact
+        ``entry.text[start:end]`` slice and any official evidence sentence inside it stays
+        covered.
+        """
+
+        query_terms = _fragment_terms(request.query)
+        spans: list[_FragmentSpan] = []
+        seen_entries: set[tuple[str, str, str]] = set()
+        for candidates in memory_candidates:
+            if candidates.hits and candidates.memory_ref is None:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            if not candidates.scope_id:
+                continue
+            for hit in candidates.hits:
+                if hit.memory_ref != candidates.memory_ref:
+                    raise PreparedContextInvariantError("memory-ref-mismatch")
+                identity = (candidates.scope_id, hit.entry_id, hit.entry_version_id)
+                if identity in seen_entries or not hit.text.strip():
+                    continue
+                seen_entries.add(identity)
+                for start, end in _fragment_windows(hit.text):
+                    spans.append(
+                        _FragmentSpan(
+                            scope_id=candidates.scope_id,
+                            memory_ref=hit.memory_ref,
+                            entry_id=hit.entry_id,
+                            entry_version_id=hit.entry_version_id,
+                            start=start,
+                            end=end,
+                            text=hit.text[start:end],
+                            words=_fragment_terms(hit.text[start:end]),
+                        )
+                    )
+        if not spans:
+            return None, (), (), PreparedContextOmissions()
+
+        scores = _fragment_scores(spans, query_terms)
+        order = sorted(range(len(spans)), key=lambda index: (-scores[index], index))
+        fragments: list[PreparedContextFragment] = []
+        items: list[dict[str, object]] = []
+        per_entry: Counter[tuple[str, str]] = Counter()
+        dropped = 0
+        for index in order:
+            span = spans[index]
+            entry_key = (span.entry_id, span.entry_version_id)
+            if per_entry[entry_key] >= _MAX_FRAGMENTS_PER_ENTRY:
+                continue
+            if len(fragments) >= self.entry_limit:
+                break
+            fragment = _fit_fragment(items, span, request.max_bytes)
+            if fragment is None:
+                dropped += 1
+                continue
+            per_entry[entry_key] += 1
+            fragments.append(fragment)
+            items.append(_fragment_item(span, fragment.text))
+        if not fragments:
+            return None, (), (), PreparedContextOmissions(dropped_items=dropped)
+        content = _render_fragment_items(items)
+        origins: tuple[PreparedContextOrigin, ...] = tuple(
+            MemoryCitation(
+                memory_ref=fragment.address.memory.artifact,
+                entry_id=fragment.address.entry_id,
+                entry_version_id=fragment.address.entry_version_id,
+            )
+            for fragment in fragments
+        )
+        return content, origins, tuple(fragments), PreparedContextOmissions(dropped_items=dropped)
 
     def probe_budget(
         self,
@@ -728,3 +843,194 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+@dataclass(frozen=True)
+class _FragmentSpan:
+    """One literal sentence span of a Memory entry, before any budget fitting."""
+
+    scope_id: str
+    memory_ref: ArtifactRef
+    entry_id: str
+    entry_version_id: str
+    start: int
+    end: int
+    text: str
+    words: list[str]
+
+
+_TERM_PATTERN = re.compile(r"[a-z]+|\d+")
+_SENTENCE_BOUNDARY = re.compile(r"[.!?](?=\s+[A-Z0-9(\"\u201c\u2018])|\n+")
+_FRAGMENT_STOP_TERMS = frozenset(
+    """a an the of to in on at for from by with and or is are was were be been being as that this these
+    those it its they we our us you your has have had do does did not no but if then than there their""".split()
+)
+_MIN_FRAGMENT_CHARS = 48
+_MAX_FRAGMENT_CHARS = 600
+_MAX_FRAGMENTS_PER_ENTRY = 3
+_BM25_K1 = 1.2
+_BM25_B = 0.75
+
+
+def _fragment_terms(text: str) -> list[str]:
+    return [term for term in _TERM_PATTERN.findall(text.lower()) if term not in _FRAGMENT_STOP_TERMS]
+
+
+def _fragment_windows(text: str) -> tuple[tuple[int, int], ...]:
+    """Split one entry into contiguous sentence spans that keep exact character offsets.
+
+    Boundaries are sentence-ending punctuation followed by a new sentence (capital letter,
+    digit or opening bracket) and paragraph breaks. Decimal points such as ``1.0`` never
+    split, because the following character is not a sentence opener.
+    """
+
+    boundaries: list[int] = [0]
+    for match in _SENTENCE_BOUNDARY.finditer(text):
+        boundaries.append(match.end())
+    boundaries.append(len(text))
+
+    raw: list[tuple[int, int]] = []
+    for start, end in zip(boundaries, boundaries[1:], strict=False):
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if end > start:
+            raw.append((start, end))
+
+    merged: list[tuple[int, int]] = []
+    for start, end in raw:
+        if (end - start) < _MIN_FRAGMENT_CHARS:
+            if merged:
+                merged[-1] = (merged[-1][0], end)
+                continue
+            merged.append((start, end))
+            continue
+        merged.append((start, end))
+    if len(merged) > 1 and (merged[-1][1] - merged[-1][0]) < _MIN_FRAGMENT_CHARS:
+        merged[-2] = (merged[-2][0], merged[-1][1])
+        merged.pop()
+
+    windows: list[tuple[int, int]] = []
+    for start, end in merged:
+        while end - start > _MAX_FRAGMENT_CHARS:
+            cut = text.rfind(" ", start, start + _MAX_FRAGMENT_CHARS)
+            if cut <= start:
+                cut = start + _MAX_FRAGMENT_CHARS
+            windows.append((start, cut))
+            start = cut + 1
+            while start < end and text[start].isspace():
+                start += 1
+        if end > start:
+            windows.append((start, end))
+    return tuple(windows)
+
+
+def _fragment_scores(spans: Sequence[_FragmentSpan], query_terms: Sequence[str]) -> list[float]:
+    """Score every span against the query with BM25 plus a query-coverage term."""
+
+    query = list(dict.fromkeys(query_terms))
+    if not query:
+        return [0.0 for _ in spans]
+    document_frequency = Counter()
+    for span in spans:
+        document_frequency.update(set(span.words))
+    total = len(spans)
+    idf = {
+        term: math.log(1.0 + (total - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+        for term in query
+        if document_frequency[term]
+    }
+    average_length = sum(max(len(span.words), 1) for span in spans) / total
+    maximum_idf = sum(idf.values()) or 1.0
+    scores: list[float] = []
+    for span in spans:
+        counts = Counter(span.words)
+        length = max(len(span.words), 1)
+        factor = _BM25_K1 * (1.0 - _BM25_B + _BM25_B * length / average_length)
+        score = 0.0
+        matched = 0.0
+        for term in query:
+            frequency = counts.get(term, 0)
+            if not frequency:
+                continue
+            term_idf = idf.get(term, 0.0)
+            matched += term_idf
+            score += term_idf * frequency * (_BM25_K1 + 1.0) / (frequency + factor)
+        coverage = matched / maximum_idf
+        # Distinct rare query terms matter more than repeating one common word, so the
+        # coverage of the query vocabulary dominates the raw term-frequency score.
+        scores.append(1.6 * coverage + 1.4 * coverage * coverage + 0.35 * score)
+    return scores
+
+
+def _fragment_item(span: _FragmentSpan, text: str) -> dict[str, object]:
+    return {
+        "citation": {
+            "scope_id": span.scope_id,
+            "memory_ref": span.memory_ref.model_dump(mode="json"),
+            "entry_id": span.entry_id,
+            "entry_version_id": span.entry_version_id,
+        },
+        "content": text,
+        "start": span.start,
+        "end": span.start + len(text),
+    }
+
+
+def _render_fragment_items(items: Sequence[dict[str, object]]) -> str:
+    envelope = {"trust": "untrusted_history", "items": list(items)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _fragment_bytes(items: Sequence[dict[str, object]], span: _FragmentSpan, text: str) -> int:
+    return len(_render_fragment_items((*items, _fragment_item(span, text))).encode("utf-8"))
+
+
+def _fit_fragment(
+    items: Sequence[dict[str, object]],
+    span: _FragmentSpan,
+    max_bytes: int,
+) -> PreparedContextFragment | None:
+    """Fit one span into the remaining budget, shortening it on a word boundary if needed."""
+
+    text = span.text
+    address = MemoryEntryAddress(
+        memory=ArtifactAddress(scope_id=span.scope_id, artifact=span.memory_ref),
+        entry_id=span.entry_id,
+        entry_version_id=span.entry_version_id,
+    )
+    if _fragment_bytes(items, span, text) <= max_bytes:
+        return PreparedContextFragment(address=address, start=span.start, end=span.end, text=text)
+    if len(text) < _MIN_FRAGMENT_CHARS:
+        return None
+
+    low, high = _MIN_FRAGMENT_CHARS, len(text) - 1
+    best: int | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        cut = text.rfind(" ", 0, middle + 1)
+        if cut < _MIN_FRAGMENT_CHARS:
+            cut = middle
+        candidate = text[:cut].rstrip()
+        if not candidate:
+            high = middle - 1
+            continue
+        if _fragment_bytes(items, span, candidate) <= max_bytes:
+            best = len(candidate)
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best is None:
+        return None
+    candidate = text[:best].rstrip()
+    if len(candidate) < _MIN_FRAGMENT_CHARS:
+        return None
+    return PreparedContextFragment(
+        address=address,
+        start=span.start,
+        end=span.start + len(candidate),
+        text=candidate,
+    )
+
