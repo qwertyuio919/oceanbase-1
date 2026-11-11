@@ -849,6 +849,8 @@ async def open_builtin_runtime(
                     prompts=dict(contexts.prompt_registry.capabilities),
                 ),
                 source_window_limit=config.runtime.source_window_limit,
+                memory_source_count_threshold=config.runtime.memory_source_count_threshold,
+                topic_memory_source_count_threshold=config.runtime.topic_memory_source_count_threshold,
                 extraction_diagnostics=ExtractionDiagnostics(
                     pipeline_configured=(
                         contexts.memory_extraction
