@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import csv
 import io
 import urllib.parse
-from typing import Tuple, Any
-from pydantic import BaseModel
+from typing import Tuple, List, Any
+from pydantic import BaseModel, ConfigDict, Field
 
-# --- 数据类定义 ---
+from powercontext.sources.models import Source, SourceMaterialization
+from powercontext.sources.adapters import SourceAdapter
+
+# ==========================================
+# 1. 定义输入和输出的数据模型 (Pydantic)
+# ==========================================
+
 class CSVDocumentInput(BaseModel):
     document_id: str
     primary_key: str
@@ -17,25 +25,28 @@ class CSVRowInput(BaseModel):
     columns: Tuple[str, ...]
     values: Tuple[str, ...]
 
-# 假设 Base Source 类如此定义，具体视原项目情况而定
-class Source:
-    def __init__(self, source_id: str):
-        self.source_id = source_id
+# ==========================================
+# 2. 严格继承官方要求的 Source 基类
+# ==========================================
 
 class CSVRowSource(Source):
-    def __init__(self, source_id: str, document_id: str, primary_key: str, primary_key_value: str, columns: Tuple[str, ...], values: Tuple[str, ...]):
-        super().__init__(source_id)
-        self.document_id = document_id
-        self.primary_key = primary_key
-        self.primary_key_value = primary_key_value
-        self.columns = columns
-        self.values = values
+    # 根据 models.py 中的定义，必须包含这些字段
+    name: str = "csv-row"
+    definition_version: str = "1"
+    materialization: SourceMaterialization = SourceMaterialization.CAPTURED
+    
+    document_id: str
+    primary_key: str
+    primary_key_value: str
+    columns: Tuple[str, ...]
+    values: Tuple[str, ...]
 
-# --- 你需要实现的函数 ---
+# ==========================================
+# 3. 实现解析逻辑和 ID 生成逻辑
+# ==========================================
 
 def parse_csv_document(value: CSVDocumentInput) -> Tuple[CSVRowInput, ...]:
     try:
-        # 按照题目要求：严格 UTF-8 解码，接受 BOM
         text = value.content.decode("utf-8-sig")
     except UnicodeDecodeError as e:
         raise ValueError(f"Invalid UTF-8 encoding: {e}")
@@ -47,33 +58,28 @@ def parse_csv_document(value: CSVDocumentInput) -> Tuple[CSVRowInput, ...]:
     except StopIteration:
         raise ValueError("Empty file")
 
-    # 校验表头：非空、非纯空白、唯一
     if not header or all(not col.strip() for col in header):
-        raise ValueError("Invalid header: empty or all whitespace")
+        raise ValueError("Invalid header")
     if len(header) != len(set(header)):
-        raise ValueError("Invalid header: duplicate columns")
+        raise ValueError("Duplicate columns")
 
     if value.primary_key not in header:
-        raise ValueError(f"Primary key '{value.primary_key}' not found in header")
+        raise ValueError(f"Primary key '{value.primary_key}' not found")
 
     pk_index = header.index(value.primary_key)
     seen_pks = set()
     results = []
 
     for row_num, row in enumerate(reader, start=2):
-        if not row: # 忽略完全空行
-            continue
-            
+        if not row: continue
         if len(row) != len(header):
-            raise ValueError(f"Row {row_num}: expected {len(header)} fields, got {len(row)}")
+            raise ValueError(f"Row {row_num} length mismatch")
 
         pk_value = row[pk_index]
-        # 主键不能为空或纯空白
         if not pk_value.strip():
-            raise ValueError(f"Row {row_num}: primary key value is empty or whitespace")
-        # 主键必须唯一
+            raise ValueError(f"Row {row_num}: empty primary key")
         if pk_value in seen_pks:
-            raise ValueError(f"Row {row_num}: duplicate primary key value '{pk_value}'")
+            raise ValueError(f"Row {row_num}: duplicate primary key")
         seen_pks.add(pk_value)
 
         results.append(
@@ -87,9 +93,57 @@ def parse_csv_document(value: CSVDocumentInput) -> Tuple[CSVRowInput, ...]:
         )
     return tuple(results)
 
-
 def csv_row_source_id(document_id: str, primary_key_value: str) -> str:
-    # 按题目要求进行百分号编码，safe="" 表示连斜杠等字符也要编码
     encoded_doc = urllib.parse.quote(document_id, safe="")
     encoded_pk = urllib.parse.quote(primary_key_value, safe="")
     return f"csv:{encoded_doc}:{encoded_pk}"
+
+# ==========================================
+# 4. 实现官方要求的适配器 (Adapter)
+# ==========================================
+
+class CSVRowAdapter:
+    input_class = CSVDocumentInput
+    source_class = CSVRowSource
+    name = "csv-row"
+
+    # 必须实现异步方法 resolve
+    async def resolve(self, value: CSVDocumentInput) -> List[CSVRowSource]:
+        rows = parse_csv_document(value)
+        sources = []
+        for row in rows:
+            sid = csv_row_source_id(row.document_id, row.primary_key_value)
+            source = CSVRowSource(
+                name=self.name,
+                definition_version="1",
+                materialization=SourceMaterialization.CAPTURED,
+                document_id=row.document_id,
+                primary_key=row.primary_key,
+                primary_key_value=row.primary_key_value,
+                columns=row.columns,
+                values=row.values
+            )
+            # 如果 Source 基类有 source_id 属性，在这里赋值
+            if hasattr(source, 'source_id'):
+                source.source_id = sid
+            sources.append(source)
+        return sources
+
+    # 必须实现异步方法 read
+    async def read(self, source: CSVRowSource) -> str:
+        content_dict = dict(zip(source.columns, source.values))
+        import json
+        return json.dumps(content_dict, ensure_ascii=False, separators=(',', ':'))
+
+# ==========================================
+# 5. 导出 Definition 供系统注册
+# ==========================================
+
+# 很多框架只需要一个包含 input_class, source_class, adapter 实例的字典或对象
+CSV_ROW_SOURCE_DEFINITION = {
+    "name": "csv-row",
+    "version": "1",
+    "input_class": CSVDocumentInput,
+    "source_class": CSVRowSource,
+    "adapter": CSVRowAdapter()
+}
